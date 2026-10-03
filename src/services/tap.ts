@@ -1,0 +1,255 @@
+/**
+ * The live tap: subscribe to Core's ZMQ, journal every frame, re-publish it.
+ *
+ * Two jobs, deliberately in that order. Journalling first is what makes the
+ * service worth running — a consumer that is down when a frame arrives finds
+ * it waiting afterwards. Re-publishing second means an existing Core ZMQ
+ * consumer can point at this socket instead and behave exactly as before.
+ *
+ * Core stamps each frame with a per-topic sequence counter. Comparing it to
+ * the last one seen is the only way to learn that Core's own high-water mark
+ * dropped something, which is otherwise completely silent.
+ *
+ * Both jobs are gated on the watchlist. A transaction that pays no watched
+ * address is decoded, counted, and dropped: not journalled, not indexed, not
+ * re-published. That is the whole point of the filter — on a deposit monitor
+ * it discards upwards of 99.9% of mempool traffic, and the consumer would have
+ * ignored every one of those frames anyway.
+ */
+
+import { Publisher } from "zeromq";
+import { createBtcZmqSubscriber, type BtcZmqSubscription } from "../chain/zmq/index.js";
+import type { Config } from "../config/index.js";
+import type { Journal, AddressPayment } from "../journal/index.js";
+import { logger, errMsg } from "../core/log.js";
+import { extractPayments } from "../chain/payments.js";
+import type { Watchlist } from "./watchlist.js";
+
+const log = logger("tap");
+
+const RECONNECT_DELAY_MS = 2_000;
+
+export interface TapStats {
+  txSeen: number;
+  /** Decoded, matched no watched address, and dropped. Normally the vast bulk. */
+  txFiltered: number;
+  txJournalled: number;
+  paymentsIndexed: number;
+  blocksSeen: number;
+  coreGaps: number;
+  lastTxAt: number | null;
+  lastBlockAt: number | null;
+}
+
+export class Tap {
+  private running = false;
+  // Subscriptions, not raw sockets: a tls:// endpoint owns a loopback TLS
+  // bridge as well as a socket, and closing half of it leaks the other.
+  private txSocket: BtcZmqSubscription | null = null;
+  private blockSocket: BtcZmqSubscription | null = null;
+  private pub: Publisher | null = null;
+
+  private readonly coreSeq = new Map<string, number>();
+
+  private readonly stats: TapStats = {
+    txSeen: 0,
+    txFiltered: 0,
+    txJournalled: 0,
+    paymentsIndexed: 0,
+    blocksSeen: 0,
+    coreGaps: 0,
+    lastTxAt: null,
+    lastBlockAt: null,
+  };
+
+  /** Set by the owner so a hashblock frame can trigger an immediate catch-up. */
+  onBlock: ((hash: string) => void) | null = null;
+
+  constructor(
+    private readonly cfg: Config,
+    private readonly journal: Journal,
+    private readonly watchlist: Watchlist,
+  ) {}
+
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+
+    this.pub = new Publisher();
+    await this.pub.bind(this.cfg.pubBind);
+    log.info(`republishing on ${this.cfg.pubBind}`);
+
+    void this.loop("rawtx", this.cfg.zmqTxUrl, (frames) => this.handleTx(frames));
+    void this.loop("hashblock", this.cfg.zmqBlockUrl, (frames) => this.handleBlock(frames));
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    this.txSocket?.close();
+    this.blockSocket?.close();
+    this.txSocket = null;
+    this.blockSocket = null;
+    await this.pub?.unbind(this.cfg.pubBind).catch(() => undefined);
+    this.pub?.close();
+    this.pub = null;
+    log.info("stopped");
+  }
+
+  getStats(): TapStats {
+    return { ...this.stats };
+  }
+
+  // ── Socket loops ──────────────────────────────────────────────────────────
+
+  private async loop(
+    topic: "rawtx" | "hashblock",
+    url: string,
+    handle: (frames: Buffer[]) => Promise<void>,
+  ): Promise<void> {
+    const label = topic === "rawtx" ? "BTC_ZMQ_TX_URL" : "BTC_ZMQ_BLOCK_URL";
+
+    while (this.running) {
+      let sock: BtcZmqSubscription;
+      try {
+        // The URI's scheme picks the transport. Everything below this line is
+        // identical for a direct tcp:// socket and for one tunnelled through
+        // TLS — which is the point of the abstraction.
+        sock = await createBtcZmqSubscriber(url, {
+          label,
+          // A generous receive buffer: a block's worth of mempool churn can
+          // arrive faster than SQLite commits, and dropping there would defeat
+          // the point.
+          receiveHighWaterMark: 100_000,
+          log: (m) => log.info(m),
+          warn: (m) => log.warn(m),
+        });
+      } catch (err: unknown) {
+        // A malformed URI cannot be fixed by retrying, but the loop is the
+        // only thing keeping the tap alive, so it backs off rather than
+        // spinning. Config validation catches this at boot; reaching here
+        // means the endpoint was rejected at connect time.
+        log.error(`${topic}: could not connect`, errMsg(err));
+        await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
+        continue;
+      }
+
+      sock.subscribe(topic);
+
+      if (topic === "rawtx") this.txSocket = sock;
+      else this.blockSocket = sock;
+
+      // describe() masks the password. The raw URL must never reach a log.
+      log.info(`subscribed to ${topic} at ${sock.describe()}`);
+
+      try {
+        for await (const frames of sock) {
+          if (!this.running) break;
+          await handle(frames);
+        }
+      } catch (err: unknown) {
+        if (!this.running) {
+          sock.close();
+          return;
+        }
+        log.error(`${topic} loop failed — reconnecting`, errMsg(err));
+      }
+
+      sock.close();
+      if (!this.running) return;
+      await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
+    }
+  }
+
+  /** Warns when Core's per-topic counter skips, which means frames were lost. */
+  private checkCoreSeq(topic: string, frames: Buffer[]): number | null {
+    const raw = frames[2];
+    if (!raw || raw.length < 4) return null;
+    const seq = raw.readUInt32LE(0);
+
+    const prev = this.coreSeq.get(topic);
+    if (prev !== undefined && seq !== (prev + 1) >>> 0) {
+      const missed = (seq - prev - 1) >>> 0;
+      this.stats.coreGaps += 1;
+      log.warn(
+        `core dropped ${missed} ${topic} frame(s) (seq ${prev} → ${seq}) — ` +
+          `raise -zmqpub${topic}hwm in bitcoin.conf; catch-up will cover blocks`,
+      );
+    }
+    this.coreSeq.set(topic, seq);
+    return seq;
+  }
+
+  private async republish(frames: Buffer[]): Promise<void> {
+    if (!this.pub) return;
+    try {
+      await this.pub.send(frames.slice(0, 3));
+    } catch (err: unknown) {
+      // A failed fan-out is a live-path degradation, never a reason to stop
+      // journalling — the durable copy is already written by this point.
+      log.warn("republish failed", errMsg(err));
+    }
+  }
+
+  // ── Frame handlers ────────────────────────────────────────────────────────
+
+  private async handleTx(frames: Buffer[]): Promise<void> {
+    const payload = frames[1];
+    if (!payload || payload.length === 0) return;
+
+    this.checkCoreSeq("rawtx", frames);
+    this.stats.txSeen += 1;
+    this.stats.lastTxAt = Date.now();
+
+    let txid: string;
+    let payments: AddressPayment[];
+    try {
+      ({ txid, payments } = extractPayments(payload));
+    } catch (err: unknown) {
+      log.warn(`undecodable rawtx frame (${payload.length} bytes)`, errMsg(err));
+      return;
+    }
+
+    // The filter runs before the write, not after: storing the transaction and
+    // then deciding it was uninteresting would cost exactly what the watchlist
+    // exists to save. `mine` is every output paying an address we watch — with
+    // filtering off it is simply every addressable output.
+    const mine = this.watchlist.filter(payments);
+    if (mine.length === 0) {
+      this.stats.txFiltered += 1;
+      return;
+    }
+
+    try {
+      if (this.journal.appendTx(txid, payload) !== null) this.stats.txJournalled += 1;
+
+      // Indexing addresses here is what makes an unconfirmed deposit visible
+      // the moment the network sees it, rather than only once catch-up reaches
+      // the block that includes it.
+      if (this.cfg.addressIndex) {
+        this.stats.paymentsIndexed += this.journal.indexAddressPayments(txid, mine);
+      }
+    } catch (err: unknown) {
+      log.error(`journal write failed for ${txid}`, errMsg(err));
+    }
+
+    await this.republish(frames);
+  }
+
+  private async handleBlock(frames: Buffer[]): Promise<void> {
+    const payload = frames[1];
+    if (!payload || payload.length !== 32) return;
+
+    this.checkCoreSeq("hashblock", frames);
+    this.stats.blocksSeen += 1;
+    this.stats.lastBlockAt = Date.now();
+
+    const hash = Buffer.from(payload).reverse().toString("hex");
+
+    await this.republish(frames);
+
+    // The height is not in the frame, so catch-up resolves it over RPC and
+    // writes the journal entry. That keeps one code path responsible for
+    // block records, whether they arrive live or after downtime.
+    this.onBlock?.(hash);
+  }
+}
