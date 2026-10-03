@@ -17,6 +17,13 @@ First public release, derived from
 changes (TLS endpoints, the `deploy/nginx/` reference configs, and the
 `docker-compose.yml` fix that lets `.env` override the node URLs).
 
+### Added
+
+- Docker images on GHCR, `ghcr.io/swapzycc/btc-replay`, for amd64 and arm64.
+  `.github/workflows/release.yml` builds and publishes them on every
+  version tag, with build provenance and an SBOM, after the same boot
+  check CI runs.
+
 ### Changed from ltc-replay
 
 - Addresses use Bitcoin's network parameters: P2PKH `1…`, P2SH `3…`, native
@@ -28,4 +35,5 @@ changes (TLS endpoints, the `deploy/nginx/` reference configs, and the
 - Ports follow Bitcoin Core: RPC 8332, P2P 8333.
 
 [unreleased]: https://github.com/SwapzyCC/btc-replay/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/SwapzyCC/btc-replay/releases/tag/v1.0.0
 [1.0.0]: https://github.com/SwapzyCC/btc-replay/releases/tag/v1.0.0
