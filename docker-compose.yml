@@ -1,0 +1,118 @@
+# btc-replay alongside a Bitcoin Core node.
+#
+# The relay has to reach two things on the node: JSON-RPC, and the ZMQ
+# publishers. How it gets there depends on where bitcoind runs, and there are
+# two shapes. Pick one and delete the other.
+#
+#   A. bitcoind runs in Docker (the default below)
+#      Join its network and address it by container name. Core's RPC and ZMQ
+#      ports then need no host publishing at all, which is the safer
+#      arrangement: nothing on the node's RPC port is reachable from outside
+#      the Docker network.
+#
+#   B. bitcoind runs on the host
+#      Comment out the `networks:` block and uncomment `network_mode: host`.
+#      The relay then reaches 127.0.0.1 directly, and Core's ZMQ can stay bound
+#      to loopback where it belongs. Note that `network_mode: host` ignores
+#      `ports:` — the service listens on whatever HTTP_BIND/HTTP_PORT say.
+#
+# Everything secret comes from .env, which is not in the image and not in this
+# file. Copy .env.example and fill it in before the first `docker compose up`.
+#
+# The three endpoint URLs below default to Shape A's container names and are
+# overridden by whatever .env sets, so a node reached over TLS from another
+# host needs no edit to this file — only to .env.
+#
+# Two variables exist only for this file, because a URI cannot be split by
+# compose: PUB_PORT (the port inside PUB_BIND) and PUB_BIND_HOST (the host
+# interface the PUB port is published on). Both default to the loopback
+# arrangement in .env.example.
+
+services:
+  btc-replay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: btc-replay:latest
+    container_name: btc-replay
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # Both listeners bind all interfaces INSIDE the container. This is not a
+      # preference and .env does not get a vote: a process bound to 127.0.0.1
+      # inside a container is reachable from nothing, published port or not.
+      # Reachability is decided by `ports:` below, where HTTP_BIND is applied
+      # to the host side — which is where it means what you think it means.
+      HTTP_BIND: 0.0.0.0
+      PUB_BIND: tcp://0.0.0.0:${PUB_PORT:-28340}
+
+      # Ports and paths follow .env.
+      HTTP_PORT: ${HTTP_PORT:-28350}
+      DB_PATH: ${DB_PATH:-/app/data/journal.sqlite}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+
+      # The endpoints come from .env when it sets them, and fall back to
+      # Shape A's container names when it does not. The `${VAR:-default}` form
+      # matters: a bare `BTC_RPC_URL: http://bitcoind:8332` here would beat
+      # env_file and silently discard whatever .env says — including a tls://
+      # or https:// endpoint for a node that is not on this Docker network.
+      #
+      # Change `bitcoind` to whatever the node's service is actually called.
+      BTC_RPC_URL: ${BTC_RPC_URL:-http://bitcoind:8332}
+      BTC_ZMQ_TX_URL: ${BTC_ZMQ_TX_URL:-tcp://bitcoind:28334}
+      BTC_ZMQ_BLOCK_URL: ${BTC_ZMQ_BLOCK_URL:-tcp://bitcoind:28333}
+
+    ports:
+      # Host interface and ports both come from .env. HTTP_BIND is the host-side
+      # address here, so the loopback default in .env.example keeps a
+      # half-finished deploy unreachable rather than open; setting it to 0.0.0.0
+      # publishes to the world, which is a decision, not a default.
+      #
+      # Replay API. The bearer token is the only thing in front of it — put
+      # Cloudflare, a tunnel, or a firewall rule there before exposing it.
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-28350}:${HTTP_PORT:-28350}"
+      # ZMQ re-publish. PUB has no authentication whatsoever: anyone who can
+      # reach this port gets the full live feed. Loopback, or a private
+      # network, and nothing else.
+      - "${PUB_BIND_HOST:-127.0.0.1}:${PUB_PORT:-28340}:${PUB_PORT:-28340}"
+
+    volumes:
+      # The journal. This is the one piece of state worth keeping: losing it
+      # means re-walking the chain and, until that finishes, answering "no" to
+      # questions about deposits that did happen.
+      - ./data:/app/data
+
+    networks:
+      - bitcoin
+
+    # Shape B — bitcoind on the host. Uncomment, and comment out `networks:`
+    # and `ports:` above.
+    # network_mode: host
+
+    stop_grace_period: 30s
+
+    # The relay is a single Node process with an embedded database. It does not
+    # need much, but it should not be able to take the node down with it if a
+    # replay stream goes wrong.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  # `external: true` because bitcoind's compose project owns this network —
+  # this file joins it rather than creating a second one. If the node runs
+  # under a different project, `docker network ls` will show the real name;
+  # put that in `name:` below.
+  bitcoin:
+    external: true
+    name: bitcoin
